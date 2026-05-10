@@ -5,10 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "accelerate>=1.13.0",
+    "hf-transfer>=0.1.9",
+    "huggingface-hub[cli]>=1.14.0",
     "ipython>=9.13.0",
     "numpy>=2.4.3",
     "rich>=15.0.0",
     "torch>=2.6.0",
+    "transformers>=5.8.0",
 ]
 
 [[tool.uv.index]]
