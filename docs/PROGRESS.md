@@ -20,7 +20,7 @@ metrics/observability, reproducible benchmarks.
 - CUDA Toolkit: 12.4
 - Python: 3.11.15 (uv-managed)
 - PyTorch: 2.6.0+cu124
-- transformers: 4.46.x
+- transformers: 5.8.0
 - uv: 0.11.12
 
 **Model under test**: `Qwen/Qwen2.5-1.5B-Instruct` (FP16, ~1.54B params, ~3.1GB)
@@ -69,6 +69,46 @@ metrics/observability, reproducible benchmarks.
   prefill drops from 645ms → 28ms (23× difference).
 
 **Next session**:
-- Either: write `scripts/benchmark_baseline.py` for systematic
+- Write `scripts/benchmark_baseline.py` for systematic
   single-turn baseline across prompt lengths
-- Or: read vLLM paper Section 3-4, start `docs/notes-vllm-reading.md`
+
+---
+
+### 2026-05-10 (Day 2, afternoon)
+
+**Achievements**:
+- Wrote `scripts/benchmark_baseline.py` — single-request prompt-length
+  sweep with per-length warmup (cuBLAS autotunes per-shape),
+  `min_new_tokens` to force fixed decode count, JSONL trial dump,
+  rich.table summary. 5 trials per cell, ~3 minutes end-to-end.
+- First systematic baseline across prompt lengths (output fixed at
+  128 tok), single request, no batching:
+
+  | prompt_len | TTFT mean (ms) | decode (tok/s) | peak mem (MB) |
+  |-----------:|---------------:|---------------:|--------------:|
+  |         16 |           31.4 |           39.6 |          2961 |
+  |         64 |           29.9 |           39.1 |          2962 |
+  |        256 |           41.3 |           41.5 |          2976 |
+  |       1024 |          139.5 |           41.8 |          3046 |
+  |       2048 |          262.3 |           40.2 |          3141 |
+  |       4096 |          552.6 |           36.1 |          3325 |
+
+- Per-length warmup gave excellent stability — TTFT std at long prompts
+  is 0.4–0.8 ms (cuBLAS autotune fully cached after the warmup call).
+
+**Bugs/issues encountered**:
+- p=4096 decode tok/s degrades across the 5 trials
+  (39.2, 39.4, 37.9, 30.9, 32.9 — std=4.0 vs <1.5 at every other
+  prompt length). The one-way decline after sustained GPU load suggests
+  possible laptop GPU thermal or power throttling. Need to confirm with
+  clock/temperature snapshots before longer Phase 2 throughput benchmarks.
+
+**Next session**:
+- Start Phase 1: naive serving.
+  - Implement a FastAPI `/generate` endpoint.
+  - Keep the model resident on GPU across requests.
+  - Return generated text, TTFT, total latency, and decode tok/s.
+- Measure the overhead of HTTP serving compared with direct script-based
+  inference.
+- Use this naive server as the control baseline before implementing request
+  queues, static batching, and continuous batching.
