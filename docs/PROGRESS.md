@@ -112,3 +112,33 @@ metrics/observability, reproducible benchmarks.
   inference.
 - Use this naive server as the control baseline before implementing request
   queues, static batching, and continuous batching.
+
+  ### 2026-05-11 (Day 3)
+
+**Achievements**:
+- Phase 1 begins. Built `src/server/app.py`: FastAPI server exposing
+`POST /generate`. Model loaded once on startup via lifespan context
+  manager, warmed up before serving, freed on shutdown.
+- Single-request, stateless, synchronous design — each request runs
+  `model.generate()` to completion. Intentionally the un-batched
+  baseline against which subsequent batching work will be measured.
+- Verified end-to-end: model resident in GPU (~3GB, only present while
+  server process is alive), per-request decode tok/s matches Day 2
+  baseline within noise (~36 tok/s at p≈30, o=128) — confirming the
+  HTTP layer adds no measurable inference overhead.
+
+**Design notes**:
+- Stateless API: server holds no conversation history; clients send
+  full message context per request.
+- Lifespan-managed model loading: clean separation of startup/shutdown,
+  fail-fast on load errors, explicit GPU cleanup on shutdown.
+- Handler is `async def` but calls a synchronous `run_generate`.
+  This will block the event loop under concurrent load — deliberately
+  left as-is so the symptom is visible when batching is introduced.
+
+**Next session**:
+- Static batching with size-or-timeout admission (N=8, T=50ms initial).
+- Background batcher task coordinating an `asyncio.Queue` of pending
+  requests with per-request `asyncio.Future` for fan-out.
+- Concurrent-load test script to demonstrate the throughput delta
+  from naive serial → batched serving.
