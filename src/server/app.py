@@ -1,34 +1,46 @@
 """
-LLM serving — Phase 1, Step 1.
+LLM serving — Phase 1, Step 2.
 
-Single-request synchronous server.
-Each /generate request runs model.generate() to completion before
-returning. Concurrent requests will queue (blocked by the GIL +
-single GPU). This is intentional in this phase.
+FastAPI server with a single background batcher coroutine. Each /generate
+request hands its prompt to the batcher and awaits the batched result.
+Naive single-request path is still selectable via /generate_serial for
+A/B comparison from the benchmark script.
 """
 import time
 from contextlib import asynccontextmanager
-from threading import Thread
 
 import torch
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    TextIteratorStreamer,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from src.server.batcher import Batcher
 
 
 # Config
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+MAX_BATCH = 8
+MAX_WAIT_MS = 50.0
+
 
 # Pydantic schemas
 class GenerateRequest(BaseModel):
     prompt: str
     max_tokens: int = 256
 
+
 class GenerateResponse(BaseModel):
+    text: str
+    prompt_tokens: int
+    output_tokens: int
+    queue_wait_ms: float
+    batch_decode_ms: float
+    total_ms: float
+    batch_size: int
+    batch_decode_tok_per_s: float
+
+
+class SerialGenerateResponse(BaseModel):
     text: str
     prompt_tokens: int
     output_tokens: int
@@ -40,10 +52,8 @@ class GenerateResponse(BaseModel):
 
 # Model loading
 def load_model():
-    """Load tokenizer and model onto GPU in FP16."""
     print(f"Loading {MODEL_NAME}...")
     t0 = time.perf_counter()
-
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
@@ -51,19 +61,17 @@ def load_model():
         device_map="cuda",
     )
     model.eval()
-
     elapsed = time.perf_counter() - t0
     print(f"Loaded in {elapsed:.1f}s. Device: {model.device}, dtype: {model.dtype}")
     return tokenizer, model
 
 
-# Inference
-def run_generate(model, tokenizer, prompt: str, max_new_tokens: int):
-    """
-    Run one generate() call with timing. Returns (text, timing_dict).
+# Serial path (kept for A/B): a synchronous one-request-at-a-time
+# generate(), no batching, no padding. Mirrors the Phase 1 Step 1 baseline.
+def run_generate_serial(model, tokenizer, prompt: str, max_new_tokens: int):
+    from threading import Thread
+    from transformers import TextIteratorStreamer
 
-    Takes raw prompt string, applies chat template inside.
-    """
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": prompt},
@@ -87,7 +95,6 @@ def run_generate(model, tokenizer, prompt: str, max_new_tokens: int):
         pad_token_id=tokenizer.eos_token_id,
         streamer=streamer,
     )
-
     thread = Thread(target=model.generate, kwargs=gen_kwargs)
     t_start = time.perf_counter()
     thread.start()
@@ -105,14 +112,12 @@ def run_generate(model, tokenizer, prompt: str, max_new_tokens: int):
 
     response_text = "".join(chunks)
     num_new = len(tokenizer.encode(response_text, add_special_tokens=False))
-
     ttft_s = (t_first - t_start) if t_first else 0.0
     decode_s = (t_end - t_first) if t_first else 0.0
     decode_tok_per_s = (
         (num_new - 1) / decode_s if decode_s > 0 and num_new > 1 else 0.0
     )
-
-    timing = {
+    return response_text, {
         "prompt_tokens": prompt_len,
         "output_tokens": num_new,
         "ttft_ms": ttft_s * 1000,
@@ -120,7 +125,6 @@ def run_generate(model, tokenizer, prompt: str, max_new_tokens: int):
         "total_ms": (t_end - t_start) * 1000,
         "decode_tok_per_s": decode_tok_per_s,
     }
-    return response_text, timing
 
 
 # Lifespan
@@ -129,19 +133,32 @@ async def lifespan(app: FastAPI):
     print("[lifespan] startup: loading model")
     tokenizer, model = load_model()
 
-    # Warmup
     print("[lifespan] warmup ...")
-    _ = run_generate(model, tokenizer, "Hi", max_new_tokens=10)
+    # Warm both paths so first real request doesn't pay JIT/autotune cost.
+    _ = run_generate_serial(model, tokenizer, "Hi", max_new_tokens=10)
     print("[lifespan] warmup done")
+
+    batcher = Batcher(
+        model=model,
+        tokenizer=tokenizer,
+        max_batch=MAX_BATCH,
+        max_wait_ms=MAX_WAIT_MS,
+    )
+    await batcher.start()
+    print(f"[lifespan] batcher started (max_batch={MAX_BATCH}, max_wait_ms={MAX_WAIT_MS})")
 
     app.state.model = model
     app.state.tokenizer = tokenizer
+    app.state.batcher = batcher
 
     yield
 
+    print("[lifespan] shutdown: stopping batcher")
+    await batcher.stop()
     print("[lifespan] shutdown: freeing GPU memory")
     del app.state.model
     del app.state.tokenizer
+    del app.state.batcher
     torch.cuda.empty_cache()
 
 
@@ -151,13 +168,29 @@ app = FastAPI(lifespan=lifespan)
 # Routes
 @app.get("/")
 async def health():
-    return {"status": "alive", "model": MODEL_NAME}
+    return {
+        "status": "alive",
+        "model": MODEL_NAME,
+        "max_batch": MAX_BATCH,
+        "max_wait_ms": MAX_WAIT_MS,
+    }
 
 
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest, request: Request):
+    """Batched path. Default endpoint for Phase 1 Step 2."""
+    batcher: Batcher = request.app.state.batcher
+    result = await batcher.submit(req.prompt, req.max_tokens)
+    return GenerateResponse(**result)
+
+
+@app.post("/generate_serial", response_model=SerialGenerateResponse)
+async def generate_serial(req: GenerateRequest, request: Request):
+    """
+    Serial path. Kept so concurrent benchmarks can A/B against the
+    naive Step-1 behavior without restarting the server.
+    """
     model = request.app.state.model
     tokenizer = request.app.state.tokenizer
-
-    text, timing = run_generate(model, tokenizer, req.prompt, req.max_tokens)
-    return GenerateResponse(text=text, **timing)
+    text, timing = run_generate_serial(model, tokenizer, req.prompt, req.max_tokens)
+    return SerialGenerateResponse(text=text, **timing)

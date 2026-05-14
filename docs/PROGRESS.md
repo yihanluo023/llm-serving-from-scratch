@@ -142,3 +142,34 @@ metrics/observability, reproducible benchmarks.
   requests with per-request `asyncio.Future` for fan-out.
 - Concurrent-load test script to demonstrate the throughput delta
   from naive serial → batched serving.
+
+### 2026-05-13 (Day 4 & 5)
+
+**Achievements**:
+- Implemented Phase 1 static batching checkpoint in `src/server/batcher.py`.
+- Kept the existing FastAPI server and queue-based batcher structure:
+  requests enter an `asyncio.Queue`, `_collect_batch()` groups them by
+  size-or-timeout, and each request is resolved through its own Future.
+- Replaced the batched `model.generate()` path with an explicit
+  forward-based inference loop:
+  prefill full prompt batch → read `logits[:, -1, :]` → greedy decode →
+  update `past_key_values` → repeat.
+- Preserved request/result ordering: `results[i]` corresponds to `items[i]`.
+
+**Design notes**:
+- Static batching runs the whole batch for the shared
+  `max(item.max_tokens)` decode length.
+- EOS is tracked per row, but does not stop the batch early.
+  Finished rows keep feeding EOS until the batch completes.
+- Generated tokens are stored separately from prompt tokens, so final
+  decoding returns only the model response.
+- Manual `forward()` path exposes the internals hidden by
+  HuggingFace `generate()`: logits, token selection, attention mask
+  extension, and KV cache propagation.
+
+**Next session**:
+- Run server startup test.
+- Test `/generate_serial` and `/generate`.
+- Verify batched requests produce reasonable outputs.
+- Debug any `position_ids`, `attention_mask`, or KV-cache issues.
+- Run concurrent-load benchmark and compare serial vs static batching.
