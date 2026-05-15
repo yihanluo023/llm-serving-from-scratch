@@ -11,6 +11,45 @@ A from-scratch LLM inference serving system inspired by vLLM. Target capabilitie
 continuous batching, PagedAttention-style KV cache management, full
 metrics/observability, reproducible benchmarks.
 
+## Roadmap (4 phases)
+### Phase 0: Setup & Baseline (Week 1) — IN PROGRESS
+- [x] WSL2 + Ubuntu 22.04
+- [x] CUDA 12.4 + PyTorch 2.6 + GPU verified
+- [x] uv + Python 3.11 environment
+- [x] Project structure + git + GitHub repo
+- [x] SSH key + first push to GitHub
+- [x] VS Code + WSL extension
+- [x] HuggingFace setup + Qwen2.5-1.5B downloaded and verified loadable
+- [x] First interactive chat script (`scripts/interactive_chat.py`)
+- [x] First baseline benchmark (`scripts/benchmark_baseline.py`) — prompt-length sweep, per-length warmup, JSONL+rich
+- [ ] Read vLLM paper (Section 3-4) + browse vLLM source
+- [ ] Note-taking: `docs/notes-vllm-reading.md`
+### Phase 1: Naive Serving (Weeks 2-3)
+- FastAPI server with `/generate` endpoint
+- Tokenizer integration
+- Single-request prefill + decode loop
+- Static batching (intentionally suboptimal—becomes baseline for comparison)
+- Streaming responses (SSE)
+- Basic metrics: per-request latency
+- **Milestone**: 10 concurrent curl requests all complete (even if slow)
+### Phase 2: Continuous Batching (Weeks 4-5)
+- Iteration-level scheduler
+- Request queue, dynamic batch joining/leaving
+- Naive KV cache (per-request contiguous allocation)
+- Benchmark harness comparing static vs continuous
+- **Milestone**: First proper benchmark report showing throughput delta
+### Phase 3: PagedAttention (Weeks 6-9)
+- Block allocator + block table
+- Paged attention kernel integration (vllm-flash-attn or custom Triton)
+- Memory utilization optimization (target: 30% → 80%+)
+- Preemption mechanism
+- **Milestone**: Concurrent request count significantly improved
+### Phase 4: Long-term polish (post job-start, ongoing)
+- Prefix caching
+- Speculative decoding
+- Multi-LoRA serving
+- Visualization dashboard
+- Technical blog posts
 ---
 
 ## Environment
@@ -173,3 +212,24 @@ metrics/observability, reproducible benchmarks.
 - Verify batched requests produce reasonable outputs.
 - Debug any `position_ids`, `attention_mask`, or KV-cache issues.
 - Run concurrent-load benchmark and compare serial vs static batching.
+
+### 2026-05-14 (Day 5)
+
+**Achievements**:
+- Added HTTP server benchmark for `/generate_serial` and `/generate`.
+- Measured throughput, scheduled token throughput, client-side latency,
+  queue wait, and observed batch size across concurrency levels.
+- Verified manual static batching works end-to-end with zero failed requests.
+- Results matched the expected static batching behavior:
+  throughput scaled with concurrency until `MAX_BATCH=8`, then plateaued,
+  while queue wait increased once the batcher was saturated.
+
+**Key result**:
+- `/generate_serial` stayed around ~0.5 req/s across concurrency levels.
+- `/generate` improved from ~0.5 req/s at concurrency=1 to ~3.9 req/s
+  at concurrency=8.
+- Mean batch size reached exactly 8 at concurrency=8 and 16.
+
+**Next session**:
+- Decide whether to clean up benchmark docs/README first or begin Phase 2:
+  continuous batching.
