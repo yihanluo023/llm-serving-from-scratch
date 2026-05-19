@@ -11,8 +11,9 @@ A from-scratch LLM inference serving system inspired by vLLM. Target capabilitie
 continuous batching, PagedAttention-style KV cache management, full
 metrics/observability, reproducible benchmarks.
 
-## Roadmap (4 phases)
-### Phase 0: Setup & Baseline (Week 1) — IN PROGRESS
+## Roadmap
+
+### Phase 0: Setup & Baseline — COMPLETE
 - [x] WSL2 + Ubuntu 22.04
 - [x] CUDA 12.4 + PyTorch 2.6 + GPU verified
 - [x] uv + Python 3.11 environment
@@ -21,35 +22,62 @@ metrics/observability, reproducible benchmarks.
 - [x] VS Code + WSL extension
 - [x] HuggingFace setup + Qwen2.5-1.5B downloaded and verified loadable
 - [x] First interactive chat script (`scripts/interactive_chat.py`)
-- [x] First baseline benchmark (`scripts/benchmark_baseline.py`) — prompt-length sweep, per-length warmup, JSONL+rich
-- [ ] Read vLLM paper (Section 3-4) + browse vLLM source
-- [ ] Note-taking: `docs/notes-vllm-reading.md`
-### Phase 1: Naive Serving (Weeks 2-3)
-- FastAPI server with `/generate` endpoint
-- Tokenizer integration
-- Single-request prefill + decode loop
-- Static batching (intentionally suboptimal—becomes baseline for comparison)
-- Streaming responses (SSE)
-- Basic metrics: per-request latency
-- **Milestone**: 10 concurrent curl requests all complete (even if slow)
-### Phase 2: Continuous Batching (Weeks 4-5)
-- Iteration-level scheduler
-- Request queue, dynamic batch joining/leaving
-- Naive KV cache (per-request contiguous allocation)
-- Benchmark harness comparing static vs continuous
-- **Milestone**: First proper benchmark report showing throughput delta
-### Phase 3: PagedAttention (Weeks 6-9)
-- Block allocator + block table
-- Paged attention kernel integration (vllm-flash-attn or custom Triton)
-- Memory utilization optimization (target: 30% → 80%+)
-- Preemption mechanism
-- **Milestone**: Concurrent request count significantly improved
-### Phase 4: Long-term polish (post job-start, ongoing)
-- Prefix caching
-- Speculative decoding
-- Multi-LoRA serving
-- Visualization dashboard
-- Technical blog posts
+- [x] First baseline benchmark (`scripts/benchmark_baseline.py`)
+- [x] Prompt-length sweep with per-length warmup
+- [x] JSONL benchmark output + rich table summary
+
+### Phase 1: Naive Serving & Static Batching — COMPLETE
+- [x] FastAPI server with model loaded once on startup
+- [x] Stateless `/generate_serial` baseline endpoint
+- [x] Tokenizer integration with Qwen chat template
+- [x] Single-request generation path with TTFT / decode / total latency metrics
+- [x] Background batcher with `asyncio.Queue` + per-request `Future`
+- [x] Size-or-timeout static batching policy
+- [x] Manual forward-based generation loop
+- [x] Batched prefill
+- [x] Greedy decode from `logits[:, -1, :]`
+- [x] KV cache propagation through `past_key_values`
+- [x] Attention mask and position id handling for left-padded prompts
+- [x] Per-request result fan-out after batch completion
+- [x] Static batching benchmark across concurrency levels
+- [x] Verified throughput improvement over serial baseline
+
+### Phase 2: Continuous Batching — IN PROGRESS
+- [x] Designed continuous batcher skeleton
+- [x] Defined `_PendingItem` and `_RunningRequest`
+- [x] Designed scheduler loop for active vs idle states
+- [x] Decided active requests should share one batched KV cache
+- [x] Established invariant: `active[i] <=> past_key_values batch row i`
+- [x] Clarified one-token-lag generation state
+- [x] Decided to use left padding for KV cache merge
+- [x] Planned `real_seq_len` + `kv_pad_len` request metadata
+- [ ] Implement `_collect_initial_prefill_batch`
+- [ ] Implement `_drain_waiting_queue`
+- [ ] Implement `_prefill_new_requests`
+- [ ] Implement left-padding `_merge_new_requests`
+- [ ] Implement `_decode_one_step`
+- [ ] Implement finished-request cleanup
+- [ ] Implement result construction and metrics
+- [ ] Add `/generate_continuous` or equivalent benchmark path
+- [ ] Benchmark static vs continuous batching
+- [ ] Validate dynamic request joining/leaving
+
+### Phase 3: KV Cache Memory Management / PagedAttention-style Design — PLANNED
+- [ ] Implement simple KV head-cut optimization for shared leading padding
+- [ ] Study vLLM block allocator and block table design
+- [ ] Design per-request block metadata
+- [ ] Replace naive batched KV padding with block/page-based KV management
+- [ ] Integrate or prototype paged attention mechanism
+- [ ] Measure memory utilization improvement
+- [ ] Benchmark max concurrent requests under memory pressure
+
+### Phase 4: Long-term polish — PLANNED
+- [ ] Streaming responses with SSE
+- [ ] Prefix caching
+- [ ] Speculative decoding
+- [ ] Multi-LoRA serving
+- [ ] Better observability dashboard
+- [ ] Technical writeup / blog post
 ---
 
 ## Environment
@@ -233,3 +261,49 @@ metrics/observability, reproducible benchmarks.
 **Next session**:
 - Decide whether to clean up benchmark docs/README first or begin Phase 2:
   continuous batching.
+
+### 2026-05-19 (Day 6-8)
+
+**Achievements**:
+- Started Phase 2 continuous batching design.
+- Created the first skeleton for `src/server/continuous_batcher.py`.
+- Planned the main components:
+  - `_PendingItem` for requests waiting in the queue
+  - `_RunningRequest` for requests already admitted into the active decode batch
+  - `ContinuousBatcher` with lifecycle, submit, scheduler loop, prefill, merge, decode, cleanup, and KV helper functions
+- Kept the same high-level serving pattern from static batching.
+
+**Scheduler design notes**:
+- If there are no active requests, the scheduler blocks until the first queued request arrives, then briefly collects more requests up to `max_batch` or `max_wait_ms`.
+- If active requests already exist, the scheduler drains only currently queued requests without waiting.
+- This avoids starving existing active requests while still allowing new requests to join between decode steps.
+- Main loop order:
+  1. clean up finished requests
+  2. collect or drain new queued requests
+  3. prefill new requests
+  4. merge new requests into the active batch
+  5. clean up requests that finished immediately during prefill
+  6. decode one token step for all active requests
+
+**Important invariant**:
+- The batcher owns one batched KV cache.
+- `_RunningRequest` objects do not each own their own KV cache.
+- Instead:
+  - self.active[i] <=> self.past_key_values batch row i
+
+**Key insight**:
+- Manual generation has a one-token lag:
+  - past_key_values contains tokens that were actually passed into the model.
+  - logits are used to select the next token, but that token is not yet in KV cache.
+- For each active request:
+  - KV cache = prompt + generated_ids[:-1]
+  - last_token_id = generated_ids[-1]
+  - Each decode step feeds last_token_id, updates KV cache, and selects the next token.
+- Use left padding for KC cache merge:
+  - Left padding keeps real cached tokens as a continuous suffix.
+  - May allow a future “head cut” optimization. 
+
+**Next session**:
+- Implement _decode_one_step() using last_token_id, real_seq_len,
+  kv_pad_len, attention mask, and position ids.
+- Then implement cleanup/result handling.
