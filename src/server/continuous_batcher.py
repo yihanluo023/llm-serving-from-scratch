@@ -108,6 +108,7 @@ class ContinuousBatcher:
         while not self._stopping:
             try:
                 self._cleanup_finished()
+                self._head_cut_past_key_values()
 
                 if not self.active:
                     items = await self._collect_initial_prefill_batch()
@@ -392,41 +393,246 @@ class ContinuousBatcher:
         """
         Decode one token step for all active requests.
 
-        Feeds each request's last_token_id, updates KV cache, appends newly
-        produced tokens, and marks requests finished on EOS or max_tokens.
+        Current invariant before this function:
+        - self.active[i] matches batch row i in self.past_key_values
+        - each KV row layout is:
+            [pad] * kv_pad_len + [real cached tokens] * real_seq_len
+        - KV cache contains prompt + generated_ids[:-1]
+        - last_token_id == generated_ids[-1]
+        - last_token_id has not yet been inserted into KV cache
+
+        This function feeds last_token_id for every active request.
+        After model forward:
+        - old last_token_id is inserted into the returned KV cache
+        - logits select the next token
+        - next token becomes the new last_token_id
         """
-        raise NotImplementedError
+        if not self.active:
+            return
+
+        if self.past_key_values is None:
+            raise ValueError("Cannot decode with active requests but no KV cache.")
+
+        tok = self.tokenizer
+        device = self.model.device
+
+        eos_id = tok.eos_token_id
+        if eos_id is None:
+            raise ValueError("Tokenizer must have eos_token_id for this implementation.")
+
+        batch_size = len(self.active)
+        past_len = self._get_past_seq_len(self.past_key_values)
+
+        # Shape: [batch_size, 1]
+        # Each row feeds the token that was selected in the previous step
+        # but is not yet present in KV cache.
+        input_ids = torch.tensor(
+            [[req.last_token_id] for req in self.active],
+            dtype=torch.long,
+            device=device,
+        )
+
+        # Shape: [batch_size, past_len + 1]
+        #
+        # For each row:
+        #   past part: [0] * kv_pad_len + [1] * real_seq_len
+        #   new token: final [1]
+        attention_mask = torch.zeros(
+            (batch_size, past_len + 1),
+            dtype=torch.long,
+            device=device,
+        )
+
+        for i, req in enumerate(self.active):
+            real_start = req.kv_pad_len
+            real_end = req.kv_pad_len + req.real_seq_len
+
+            # Real cached tokens in past_key_values.
+            attention_mask[i, real_start:real_end] = 1
+
+            # Current input token, i.e. req.last_token_id.
+            attention_mask[i, past_len] = 1
+
+        # Shape: [batch_size, 1]
+        #
+        # The current input token's true position is real_seq_len.
+        # Do not use past_len, because past_len includes left padding.
+        position_ids = torch.tensor(
+            [[req.real_seq_len] for req in self.active],
+            dtype=torch.long,
+            device=device,
+        )
+
+        with torch.inference_mode():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=self.past_key_values,
+                use_cache=True,
+            )
+
+        # Now the old last_token_id has been inserted into KV cache.
+        self.past_key_values = outputs.past_key_values
+
+        # Select the next token for each request.
+        next_token_logits = outputs.logits[:, -1, :]
+        next_tokens = torch.argmax(next_token_logits, dim=-1)
+
+        t_now = time.perf_counter()
+
+        for i, req in enumerate(self.active):
+            next_token_id = int(next_tokens[i].item())
+
+            req.generated_ids.append(next_token_id)
+            req.last_token_id = next_token_id
+
+            # The token that just entered KV cache is the previous last_token_id,
+            # so real cached length grows by exactly one.
+            req.real_seq_len += 1
+
+            if req.t_first_token is None:
+                req.t_first_token = t_now
+
+            if next_token_id == eos_id or len(req.generated_ids) >= req.item.max_tokens:
+                req.finished = True
 
     def _cleanup_finished(self) -> None:
         """
         Resolve completed futures and remove finished rows from active state
         and KV cache.
         """
-        raise NotImplementedError
+        if not self.active:
+            self.past_key_values = None
+            return
+
+        finished_reqs: list[_RunningRequest] = []
+        keep_indices_list: list[int] = []
+        kept_active: list[_RunningRequest] = []
+
+        for i, req in enumerate(self.active):
+            if req.finished:
+                finished_reqs.append(req)
+            else:
+                keep_indices_list.append(i)
+                kept_active.append(req)
+
+        if not finished_reqs:
+            return
+
+        for req in finished_reqs:
+            self._set_result(req)
+
+        self.active = kept_active
+
+        if not self.active:
+            self.past_key_values = None
+            return
+
+        device = self.model.device
+        keep_indices = torch.tensor(
+            keep_indices_list,
+            dtype=torch.long,
+            device=device,
+        )
+
+        self._filter_past_key_values(keep_indices)
 
     def _set_result(self, req: _RunningRequest) -> None:
         """
         Decode generated_ids and set the response dict on req.item.future.
         """
-        raise NotImplementedError
+        if req.item.future.done():
+            return
+
+        t_done = time.perf_counter()
+
+        text = self.tokenizer.decode(
+            req.generated_ids,
+            skip_special_tokens=True,
+        )
+
+        total_s = t_done - req.item.t_enqueue
+        queue_wait_s = req.t_prefill_done - req.item.t_enqueue
+
+        # In this implementation, first token is selected during prefill.
+        # t_first_token should normally equal t_prefill_done.
+        if req.t_first_token is not None:
+            batch_decode_s = t_done - req.t_first_token
+        else:
+            batch_decode_s = 0.0
+
+        output_tokens = len(req.generated_ids)
+
+        # first token belongs to prefill/TTFT, remaining tokens belong to decode.
+        if batch_decode_s > 0 and output_tokens > 1:
+            batch_decode_tok_per_s = (output_tokens - 1) / batch_decode_s
+        else:
+            batch_decode_tok_per_s = 0.0
+
+        result = {
+            "text": text,
+            "prompt_tokens": req.prompt_tokens,
+            "output_tokens": output_tokens,
+            "queue_wait_ms": queue_wait_s * 1000,
+            "batch_decode_ms": batch_decode_s * 1000,
+            "total_ms": total_s * 1000,
+            "batch_size": len(self.active),
+            "batch_decode_tok_per_s": batch_decode_tok_per_s,
+        }
+
+        req.item.future.set_result(result)
 
     # ---------- KV helpers ----------
 
     def _filter_past_key_values(self, keep_indices: torch.Tensor) -> None:
         """
         Keep only selected batch rows in every K/V tensor.
-        """
-        raise NotImplementedError
 
-    def _pad_past_key_values_to_len(
-        self,
-        past_key_values: Any,
-        target_len: int,
-    ) -> Any:
+        keep_indices indexes the batch dimension, dim=0.
         """
-        Right-pad every K/V tensor on the sequence-length dimension.
+        if self.past_key_values is None:
+            return
+
+        filtered_layers = []
+
+        for layer in self.past_key_values:
+            k, v = layer
+
+            filtered_k = torch.index_select(k, dim=0, index=keep_indices).contiguous()
+            filtered_v = torch.index_select(v, dim=0, index=keep_indices).contiguous()
+
+            filtered_layers.append((filtered_k, filtered_v))
+
+        self.past_key_values = tuple(filtered_layers)
+    
+    def _head_cut_past_key_values(self) -> None:
         """
-        raise NotImplementedError
+        Remove common left-padding prefix shared by all active KV rows.
+
+        If every active row has at least N left-pad positions, those N positions
+        are useless for all rows and can be removed from every K/V tensor.
+        """
+        if not self.active or self.past_key_values is None:
+            return
+
+        cut_len = min(req.kv_pad_len for req in self.active)
+
+        if cut_len <= 0:
+            return
+
+        cut_layers = []
+
+        for layer in self.past_key_values:
+            k, v = layer
+            cut_k = k[:, :, cut_len:, :].contiguous()
+            cut_v = v[:, :, cut_len:, :].contiguous()
+            cut_layers.append((cut_k, cut_v))
+
+        self.past_key_values = tuple(cut_layers)
+
+        for req in self.active:
+            req.kv_pad_len -= cut_len
 
     # ---------- error handling ----------
 
@@ -434,4 +640,26 @@ class ContinuousBatcher:
         """
         Fail queued and active requests, then reset scheduler state.
         """
-        raise NotImplementedError
+        print(f"[continuous-batcher] error: {type(exc).__name__}: {exc}")
+
+        # Fail all active requests
+        for req in self.active:
+            if not req.item.future.done():
+                req.item.future.set_exception(exc)
+
+        # Fail all queued-but-not-yet-prefilled requests
+        while True:
+            try:
+                item = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            if not item.future.done():
+                item.future.set_exception(exc)
+
+        # Reset scheduler state
+        self.active = []
+        self.past_key_values = None
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

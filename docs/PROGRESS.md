@@ -51,13 +51,17 @@ metrics/observability, reproducible benchmarks.
 - [x] Clarified one-token-lag generation state
 - [x] Decided to use left padding for KV cache merge
 - [x] Planned `real_seq_len` + `kv_pad_len` request metadata
-- [ ] Implement `_collect_initial_prefill_batch`
-- [ ] Implement `_drain_waiting_queue`
-- [ ] Implement `_prefill_new_requests`
-- [ ] Implement left-padding `_merge_new_requests`
-- [ ] Implement `_decode_one_step`
-- [ ] Implement finished-request cleanup
-- [ ] Implement result construction and metrics
+- [x] Implement `_collect_initial_prefill_batch`
+- [x] Implement `_drain_waiting_queue`
+- [x] Implement `_prefill_new_requests`
+- [x] Implement left-padding `_merge_new_requests`
+- [x] Implement `_decode_one_step`
+- [x] Implement finished-request cleanup
+- [x] Implement result construction and metrics
+- [x] Implement KV row filtering
+- [x] Implement common-left-padding head-cut
+- [x] Implement scheduler failure handling
+- [ ] Write continuous batcher smoke test
 - [ ] Add `/generate_continuous` or equivalent benchmark path
 - [ ] Benchmark static vs continuous batching
 - [ ] Validate dynamic request joining/leaving
@@ -307,3 +311,30 @@ metrics/observability, reproducible benchmarks.
 - Implement _decode_one_step() using last_token_id, real_seq_len,
   kv_pad_len, attention mask, and position ids.
 - Then implement cleanup/result handling.
+
+### 2026-06-01
+
+**Achievements**:
+- Completed the main Phase 2 continuous batching helpers:
+  `_decode_one_step`, `_cleanup_finished`, `_filter_past_key_values`,
+  `_set_result`, `_head_cut_past_key_values`, and `_fail_all`.
+- Implemented one-step batched decode with `past_key_values`, temporary
+  `attention_mask` / `position_ids`, greedy token selection, and per-request
+  state updates.
+- Added finished-request cleanup, KV batch-row filtering, result fan-out via
+  per-request `Future`, and failure handling to avoid hanging requests.
+- Added common-left-padding head-cut to remove shared padding from KV cache
+  after cleanup.
+
+**Design notes**:
+- Kept the core invariant:
+  `active[i] <=> past_key_values batch row i`.
+- Preserved the one-token-lag model:
+  KV cache contains `prompt + generated_ids[:-1]`, while `last_token_id`
+  is fed on the next decode step.
+- Kept `attention_mask` and `position_ids` as temporary decode-step tensors
+  instead of persistent scheduler state.
+
+**Next session**:
+- Write smoke tests for single request, concurrent requests, and dynamic
+  request joining/leaving before connecting the FastAPI endpoint.

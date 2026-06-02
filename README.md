@@ -23,8 +23,8 @@ codebase so their performance tradeoffs can be measured directly.
 `model.generate()` hides everything interesting. This project deliberately
 removes that abstraction and rebuilds the inference loop from direct model
 calls + `past_key_values`, so that every mechanism a real serving stack relies
-on — left-padded batches, attention masks, position ids, KV-cache propagation,
-request fan-out, dynamic batch membership — is understood rather than configured.
+on - left-padded batches, attention masks, position ids, KV-cache propagation,
+request fan-out, dynamic batch membership - is understood rather than configured.
 
 Each phase introduces one new problem and resolves it before moving on.
 The known limitations of each phase are kept so the next phase has a concrete
