@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.server.batcher import Batcher
+from src.server.continuous_batcher import ContinuousBatcher
 
 
 # Config
@@ -134,9 +135,10 @@ async def lifespan(app: FastAPI):
     tokenizer, model = load_model()
 
     print("[lifespan] warmup ...")
-    # Warm both paths so first real request doesn't pay JIT/autotune cost.
+    # Warm the serial path first; this compiles the shared model kernels.
+    # The batcher paths are warmed below, once started, so their own shapes
+    # (padded prefill / merge / decode loop) get autotuned too.
     _ = run_generate_serial(model, tokenizer, "Hi", max_new_tokens=10)
-    print("[lifespan] warmup done")
 
     batcher = Batcher(
         model=model,
@@ -145,20 +147,39 @@ async def lifespan(app: FastAPI):
         max_wait_ms=MAX_WAIT_MS,
     )
     await batcher.start()
-    print(f"[lifespan] batcher started (max_batch={MAX_BATCH}, max_wait_ms={MAX_WAIT_MS})")
+    print(f"[lifespan] static batcher started (max_batch={MAX_BATCH}, max_wait_ms={MAX_WAIT_MS})")
+
+    continuous_batcher = ContinuousBatcher(
+        model=model,
+        tokenizer=tokenizer,
+        max_batch=MAX_BATCH,
+        max_wait_ms=MAX_WAIT_MS,
+    )
+    await continuous_batcher.start()
+    print(f"[lifespan] continuous batcher started (max_batch={MAX_BATCH}, max_wait_ms={MAX_WAIT_MS})")
+
+    # Warm the batcher-specific code paths so the first real request to either
+    # endpoint doesn't pay autotune cost (matters for a clean first-request TTFT).
+    _ = await batcher.submit("Hi", 10)
+    _ = await continuous_batcher.submit("Hi", 10)
+    print("[lifespan] warmup done")
 
     app.state.model = model
     app.state.tokenizer = tokenizer
     app.state.batcher = batcher
+    app.state.continuous_batcher = continuous_batcher
 
     yield
 
-    print("[lifespan] shutdown: stopping batcher")
-    await batcher.stop()
+    print("[lifespan] shutdown: stopping batchers")
+    await app.state.batcher.stop()
+    await app.state.continuous_batcher.stop()
+
     print("[lifespan] shutdown: freeing GPU memory")
     del app.state.model
     del app.state.tokenizer
     del app.state.batcher
+    del app.state.continuous_batcher
     torch.cuda.empty_cache()
 
 
@@ -175,15 +196,6 @@ async def health():
         "max_wait_ms": MAX_WAIT_MS,
     }
 
-
-@app.post("/generate", response_model=GenerateResponse)
-async def generate(req: GenerateRequest, request: Request):
-    """Batched path. Default endpoint for Phase 1 Step 2."""
-    batcher: Batcher = request.app.state.batcher
-    result = await batcher.submit(req.prompt, req.max_tokens)
-    return GenerateResponse(**result)
-
-
 @app.post("/generate_serial", response_model=SerialGenerateResponse)
 async def generate_serial(req: GenerateRequest, request: Request):
     """
@@ -194,3 +206,19 @@ async def generate_serial(req: GenerateRequest, request: Request):
     tokenizer = request.app.state.tokenizer
     text, timing = run_generate_serial(model, tokenizer, req.prompt, req.max_tokens)
     return SerialGenerateResponse(text=text, **timing)
+
+
+@app.post("/generate", response_model=GenerateResponse)
+async def generate(req: GenerateRequest, request: Request):
+    """Batched path. Default endpoint for Phase 1 Step 2."""
+    batcher: Batcher = request.app.state.batcher
+    result = await batcher.submit(req.prompt, req.max_tokens)
+    return GenerateResponse(**result)
+
+
+@app.post("/generate_continuous", response_model=GenerateResponse)
+async def generate_continuous(req: GenerateRequest, request: Request):
+    """Continuous batching path for Phase 2."""
+    batcher: ContinuousBatcher = request.app.state.continuous_batcher
+    result = await batcher.submit(req.prompt, req.max_tokens)
+    return GenerateResponse(**result)

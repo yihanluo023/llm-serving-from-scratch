@@ -338,3 +338,53 @@ metrics/observability, reproducible benchmarks.
 **Next session**:
 - Write smoke tests for single request, concurrent requests, and dynamic
   request joining/leaving before connecting the FastAPI endpoint.
+
+### 2026-06-05
+
+**Achievements**:
+* Added `scripts/smoke_test_continuous_batcher.py` to test the Phase 2
+  `ContinuousBatcher` directly before relying on the FastAPI layer.
+* Verified the continuous batcher with:
+  * single-request generation
+  * concurrent requests
+  * mixed output lengths
+  * dynamic request joining/leaving
+  * final cleanup of `active` and `past_key_values`
+* Added `/generate_continuous` to `src/server/app.py` while preserving the
+  existing `/generate_serial` and `/generate` paths for future comparison.
+* Verified `/generate_continuous` through single-request, concurrent, and
+  staggered-arrival HTTP smoke tests.
+
+**Bugs/issues encountered**:
+* Smoke testing exposed a HuggingFace cache format mismatch:
+  `outputs.past_key_values` now returns a `DynamicCache`, while the batcher
+  internally expects the legacy tuple layout:
+  `(key, value)` per transformer layer.
+* Fixed this with boundary conversion helpers:
+  `_to_legacy_past_key_values()` and `_from_legacy_past_key_values()`.
+  The scheduler keeps using the legacy tuple format internally so KV tensor
+  operations such as padding, concatenation, filtering, and head-cut remain
+  easy to inspect.
+* This also isolates HuggingFace cache API changes behind small helper
+  functions, preserving the core scheduler logic.
+* Staggered HTTP testing revealed an event-loop blocking issue: synchronous
+  `model.forward()` calls inside `_run()` prevented FastAPI from promptly
+  admitting late-arriving requests into the queue.
+* Fixed this by dispatching blocking prefill/decode forwards through
+  `run_in_executor()`. The event loop can now continue accepting HTTP requests
+  while the current GPU forward is running, while scheduler state mutations
+  remain serialized because `_run()` still awaits each forward before
+  continuing.
+
+**Design notes**:
+* `ContinuousBatcher` now separates three concerns:
+  * scheduler logic: active batch, waiting queue, joining/leaving
+  * KV representation: legacy tuple internally, `DynamicCache` at model boundary
+  * server responsiveness: blocking model forwards moved off the event loop
+* The current `batch_size` metric is still a rough cleanup-time snapshot, not a
+  precise lifecycle batch-size metric. Future benchmarks should track clearer
+  metrics such as max active batch size or per-request admitted batch size.
+
+**Next session**:
+* Write a mixed-length internal benchmark comparing static batching against
+  continuous batching.

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Any
 
 import torch
+from transformers import DynamicCache
 
 
 @dataclass
@@ -101,10 +102,16 @@ class ContinuousBatcher:
         """
         Main continuous batching loop.
 
-        If no active requests exist, block for the first pending request and
-        briefly collect more. If active requests exist, drain queued requests
-        without waiting, then prefill/merge them before the next decode step.
+        When idle, wait for an initial prefill batch. While active requests are
+        decoding, drain already queued requests without waiting, prefill/merge
+        them, then decode one token for the active batch.
+
+        Model forwards run in the default executor so they do not block the
+        FastAPI event loop from admitting new requests. This coroutine still
+        awaits each forward before mutating scheduler state, so active/KV state
+        stays serialized.
         """
+        loop = asyncio.get_running_loop()
         while not self._stopping:
             try:
                 self._cleanup_finished()
@@ -116,14 +123,16 @@ class ContinuousBatcher:
                     items = self._drain_waiting_queue()
 
                 if items:
-                    new_running, new_past = self._prefill_new_requests(items)
+                    new_running, new_past = await loop.run_in_executor(
+                        None, self._prefill_new_requests, items
+                    )
                     self._merge_new_requests(new_running, new_past)
                     # Some new requests may finish immediately during prefill:
                     # first token is EOS, or max_tokens == 1.
                     self._cleanup_finished()
 
                 if self.active:
-                    self._decode_one_step()
+                    await loop.run_in_executor(None, self._decode_one_step)
 
             except asyncio.CancelledError:
                 raise
@@ -239,7 +248,7 @@ class ContinuousBatcher:
                 use_cache=True,
             )
 
-        new_past_key_values = outputs.past_key_values
+        new_past_key_values = self._to_legacy_past_key_values(outputs.past_key_values)
         next_token_logits = outputs.logits[:, -1, :]
         first_tokens = torch.argmax(next_token_logits, dim=-1)
 
@@ -334,6 +343,67 @@ class ContinuousBatcher:
 
         self.active.extend(new_running)
         self.past_key_values = tuple(merged_past)
+
+    def _to_legacy_past_key_values(self, past_key_values: Any) -> Any:
+        """
+        Convert HuggingFace Cache objects such as DynamicCache into the older
+        tuple-of-layers format used by this educational implementation.
+
+        Legacy layout:
+            tuple(
+                (key, value),  # layer 0
+                (key, value),  # layer 1
+                ...
+            )
+        """
+        # Older transformers: Cache objects expose to_legacy_cache().
+        if hasattr(past_key_values, "to_legacy_cache"):
+            return past_key_values.to_legacy_cache()
+
+        # Mid-era transformers: DynamicCache stored parallel key/value lists.
+        if hasattr(past_key_values, "key_cache") and hasattr(
+            past_key_values, "value_cache"
+        ):
+            return tuple(
+                (k, v)
+                for k, v in zip(
+                    past_key_values.key_cache,
+                    past_key_values.value_cache,
+                )
+            )
+
+        # transformers >= 5: DynamicCache holds a list of layer objects, each
+        # exposing .keys / .values tensors.
+        if hasattr(past_key_values, "layers"):
+            return tuple(
+                (layer.keys, layer.values) for layer in past_key_values.layers
+            )
+
+        return past_key_values
+
+    def _from_legacy_past_key_values(self, past_key_values: Any) -> Any:
+        """
+        Convert a legacy tuple-of-layers KV cache back into the Cache object
+        the model expects as input.
+
+        transformers >= 5 dropped support for feeding the legacy tuple format
+        into model.forward(past_key_values=...); it now requires a Cache
+        instance. This is the inverse of _to_legacy_past_key_values so the
+        scheduler can keep operating on plain tuples internally.
+        """
+        if past_key_values is None:
+            return None
+
+        # Already a Cache object (not a legacy tuple/list) -> pass through.
+        if not isinstance(past_key_values, (tuple, list)):
+            return past_key_values
+
+        # Older transformers exposed an explicit constructor.
+        if hasattr(DynamicCache, "from_legacy_cache"):
+            return DynamicCache.from_legacy_cache(past_key_values)
+
+        # transformers >= 5: the constructor accepts the per-layer (k, v) tuples.
+        return DynamicCache(ddp_cache_data=past_key_values)
 
     def _get_past_seq_len(self, past_key_values: Any) -> int:
         """
@@ -468,12 +538,14 @@ class ContinuousBatcher:
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=self.past_key_values,
+                past_key_values=self._from_legacy_past_key_values(
+                    self.past_key_values
+                ),
                 use_cache=True,
             )
 
         # Now the old last_token_id has been inserted into KV cache.
-        self.past_key_values = outputs.past_key_values
+        self.past_key_values = self._to_legacy_past_key_values(outputs.past_key_values)
 
         # Select the next token for each request.
         next_token_logits = outputs.logits[:, -1, :]
