@@ -42,7 +42,7 @@ metrics/observability, reproducible benchmarks.
 - [x] Static batching benchmark across concurrency levels
 - [x] Verified throughput improvement over serial baseline
 
-### Phase 2: Continuous Batching — IN PROGRESS
+### Phase 2: Continuous Batching — COMPLETE
 - [x] Designed continuous batcher skeleton
 - [x] Defined `_PendingItem` and `_RunningRequest`
 - [x] Designed scheduler loop for active vs idle states
@@ -61,13 +61,22 @@ metrics/observability, reproducible benchmarks.
 - [x] Implement KV row filtering
 - [x] Implement common-left-padding head-cut
 - [x] Implement scheduler failure handling
-- [ ] Write continuous batcher smoke test
-- [ ] Add `/generate_continuous` or equivalent benchmark path
-- [ ] Benchmark static vs continuous batching
-- [ ] Validate dynamic request joining/leaving
+- [x] Add HuggingFace `DynamicCache` <-> legacy tuple conversion helpers
+- [x] Move blocking model forwards off the FastAPI event loop with `run_in_executor`
+- [x] Write continuous batcher smoke test
+- [x] Validate single-request generation
+- [x] Validate concurrent requests
+- [x] Validate mixed output lengths
+- [x] Validate dynamic request joining/leaving
+- [x] Validate final cleanup of `active` and `past_key_values`
+- [x] Add `/generate_continuous` endpoint
+- [x] Verify `/generate_continuous` through HTTP smoke tests
+- [x] Benchmark static vs continuous batching
+- [x] Confirm expected tradeoff:
+  - static is slightly faster on uniform-length workloads
+  - continuous strongly reduces head-of-line blocking on heterogeneous workloads
 
-### Phase 3: KV Cache Memory Management / PagedAttention-style Design — PLANNED
-- [ ] Implement simple KV head-cut optimization for shared leading padding
+### Phase 3: KV Cache Memory Management / PagedAttention-style Design — IN PROGRESS
 - [ ] Study vLLM block allocator and block table design
 - [ ] Design per-request block metadata
 - [ ] Replace naive batched KV padding with block/page-based KV management
@@ -339,7 +348,7 @@ metrics/observability, reproducible benchmarks.
 - Write smoke tests for single request, concurrent requests, and dynamic
   request joining/leaving before connecting the FastAPI endpoint.
 
-### 2026-06-05
+### 2026-06-04
 
 **Achievements**:
 * Added `scripts/smoke_test_continuous_batcher.py` to test the Phase 2
@@ -388,3 +397,36 @@ metrics/observability, reproducible benchmarks.
 **Next session**:
 * Write a mixed-length internal benchmark comparing static batching against
   continuous batching.
+
+### 2026-06-05 (benchmark)
+
+**Achievements**:
+* Added and ran `benchmarks/benchmark_continuous_vs_static.py` to compare
+  `/generate` static batching against `/generate_continuous`.
+* Used an open-loop benchmark with the same seeded arrival schedule for both
+  endpoints:
+  * 96 requests
+  * 10s arrival window
+  * uniform-length control workload
+  * heterogeneous workload with mixed short and long generations
+* Verified the expected tradeoff:
+  * static batching is slightly faster in the uniform-length control workload
+  * continuous batching strongly outperforms static batching in the
+    heterogeneous workload
+
+**Key result**:
+* Uniform control workload:
+  * static: e2e p99 = 16.4s, output throughput = 257.5 tok/s
+  * continuous: e2e p99 = 18.2s, output throughput = 239.5 tok/s
+  * Interpretation: continuous batching has some overhead when request lengths
+    are similar and static batching already works well.
+* Heterogeneous workload:
+  * short-request e2e p99 improved from 39.0s to 13.1s
+  * overall e2e p99 improved from 42.5s to 14.8s
+  * overall output throughput improved from 96.1 tok/s to 197.0 tok/s
+  * Interpretation: continuous batching reduces head-of-line blocking under
+    mixed generation lengths by allowing requests to join and leave the active
+    decode batch dynamically.
+
+**Next session**:
+* Begin Phase 3 planning around PagedAttention-style KV-cache memory management.
