@@ -430,3 +430,13 @@ metrics/observability, reproducible benchmarks.
 
 **Next session**:
 * Begin Phase 3 planning around PagedAttention-style KV-cache memory management.
+
+### 2026-06-10
+
+**Achievements**:
+- Started Phase 3 with a toy paged KV-cache prototype.
+- Added a small script to split K/V tensors into fixed-size blocks and recover them through a block table.
+- Verified the paged/block version matches normal contiguous attention with `torch.allclose`.
+
+**Next session**:
+- Start implementing a real paged KV-cache manager with a global block pool, free-block list, per-request block tables, and dynamic block allocation/freeing.
